@@ -1,0 +1,122 @@
+name: payment-contingency-decisioning
+summary: >
+  A payment orchestration system that fans out to external risk, sanctions, and funds-control
+  checks before releasing payments. When any external check fails or times out, a deterministic
+  rule-driven contingency engine substitutes a decision based on client credit rating and other
+  heuristics. Every contingency-released payment is re-verified once external systems recover.
+
+constraints:
+  - p99 end-to-end latency < 5s for wire/RTP payments
+  - Zero tolerance for sanctions-violating releases (regulatory)
+  - All contingency decisions must be fully auditable and replayable
+  - Contingency engine must be deterministic — no ML in v1
+  - Conservative default — hold for manual review when confidence is marginal
+  - Every contingency release must be re-verified post-hoc when the missing external system recovers
+
+components:
+  - id: payment-ingress
+    kind: service
+    description: Receives wire/ACH/SWIFT/RTP payment requests from upstream channels.
+    sla_p99_ms: 100
+
+  - id: orchestrator
+    kind: service
+    description: Coordinates the fan-out to external checks; holds circuit breakers for each.
+    sla_p99_ms: 4500
+    notes: Per-external-service circuit breakers with configurable thresholds.
+
+  - id: risk-check
+    kind: external_api
+    description: External risk scoring service (third-party vendor).
+    sla_p99_ms: 2000
+    notes: Historically the least reliable of the three external services.
+
+  - id: sanctions-check
+    kind: external_api
+    description: OFAC/sanctions screening service.
+    sla_p99_ms: 2000
+    notes: Regulatory critical. No substitute decision is acceptable for sanctions matches.
+
+  - id: funds-control
+    kind: external_api
+    description: Validates account balance and holds funds.
+    sla_p99_ms: 1500
+    notes: Stateful — failed requests may leave dangling holds.
+
+  - id: contingency-engine
+    kind: service
+    description: >
+      Rule-driven deterministic decisioning. Invoked only when an external check fails.
+      Uses client credit rating, historical patterns, amount thresholds, and destination rules
+      to produce release/hold/reject with confidence score.
+    sla_p99_ms: 500
+    notes: >
+      Rules are versioned and signed. Every decision emits an audit record with the exact
+      rule set hash, inputs, and output for replay.
+
+  - id: decision-aggregator
+    kind: service
+    description: Combines external check outcomes (or contingency substitutes) into a final decision.
+    sla_p99_ms: 100
+
+  - id: audit-store
+    kind: database
+    description: Append-only store of all decisions, contingency or otherwise, for regulatory review.
+    notes: WORM semantics; retention driven by regulatory schedule.
+
+  - id: reverify-queue
+    kind: queue
+    description: >
+      Queue of contingency-released payments awaiting re-verification once the missing
+      external service recovers.
+    notes: At-least-once delivery; idempotent reverification consumer.
+
+  - id: reverify-consumer
+    kind: service
+    description: Re-runs the originally-missing external check and reconciles against the audit record.
+    notes: Emits alerts if reverification disagrees with the contingency decision.
+
+edges:
+  - source: payment-ingress
+    target: orchestrator
+    pattern: sync_request
+
+  - source: orchestrator
+    target: risk-check
+    pattern: sync_request
+    notes: Circuit-breaker-wrapped, 2s timeout.
+
+  - source: orchestrator
+    target: sanctions-check
+    pattern: sync_request
+    notes: Circuit-breaker-wrapped, 2s timeout.
+
+  - source: orchestrator
+    target: funds-control
+    pattern: sync_request
+    notes: Circuit-breaker-wrapped, 1.5s timeout.
+
+  - source: orchestrator
+    target: contingency-engine
+    pattern: sync_request
+    notes: Invoked only when one or more external checks trips its circuit breaker.
+
+  - source: orchestrator
+    target: decision-aggregator
+    pattern: sync_request
+
+  - source: decision-aggregator
+    target: audit-store
+    pattern: async_produce
+    delivery: at_least_once
+
+  - source: decision-aggregator
+    target: reverify-queue
+    pattern: async_produce
+    delivery: at_least_once
+    notes: Populated only when decision was contingency-based.
+
+  - source: reverify-queue
+    target: reverify-consumer
+    pattern: async_consume
+    delivery: at_least_once
